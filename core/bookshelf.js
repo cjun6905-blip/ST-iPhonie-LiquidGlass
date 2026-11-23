@@ -1,0 +1,339 @@
+import {archiveBuffer} from './archive-io.js';
+// Local book reading. Archive entries are opened on demand, never retained by the ZIP directory.
+import {readZipBlob} from './model-files.js';
+import {AppStore} from './app-store.js';
+
+const bookExtensions = ['.epub', '.txt', '.md', '.markdown', '.cbz'];
+export const bookFileAccept = [...bookExtensions, '.zip'].join(',');
+const fileExtension = name => /\.[^.\/]+$/.exec(name.toLowerCase())?.[0] || '';
+const bookTitle = name => name.slice(0, name.length - fileExtension(name).length);
+const visibleEntry = path => path.split('/').every(part => part && !part.startsWith('.') && part !== '__MACOSX');
+
+export const readerDefaults = {size: 19, line: 1.9, margin: 24, font: 'serif', theme: 'auto', mode: 'pages', rtl: false, annotations: true, effect: 'page'};
+/** 翻页效果 (0.9.52): 仿真翻页 / 平滑滑动 / 无。 */
+export const READ_EFFECTS = Object.freeze(['page', 'slide', 'none']);
+export const effectOf = value => READ_EFFECTS.includes(value) ? value : 'page';
+const escape = s => String(s).replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+export function decodeBook(bytes) {
+  try { return new TextDecoder('utf-8', {fatal: true}).decode(bytes).replace(/^\uFEFF/, ''); }
+  catch { return new TextDecoder('gbk').decode(bytes); }
+}
+export function txtChapters(text) {
+  const lines = String(text).replace(/\r\n?/g, '\n').split('\n'), chapters = [];
+  let title = '正文', words = [];
+  const flush = () => { if (words.length) chapters.push({title, text: words.join('\n')}); words = []; };
+  let length = 0;
+  for (const line of lines) {
+    if (/^\s*(?:第[零〇一二三四五六七八九十百千万两\d]+[章卷回节部]|序章|序言|楔子|尾声|后记|chapter\s+\d+).{0,70}$/i.test(line)) { flush(); title = line.trim(); length = 0; }
+    if (length > 16000) { flush(); length = 0; }
+    if (line.length > 16000) {
+      for (let at=0;at<line.length;at+=16000) { if(length)flush(); words.push(line.slice(at,at+16000)); length=16000; if(at+16000<line.length){flush();length=0;} }
+    } else { words.push(line); length += line.length; }
+  }
+  flush(); return chapters.length ? chapters : [{title: '正文', text: ''}];
+}
+export function bookPath(base, href) {
+  let raw; try { raw = decodeURIComponent(String(href || '').split('#')[0]); } catch { return ''; }
+  if (!raw || /^(?:[a-z][\w+.-]*:|\/|\\)/i.test(raw)) return '';
+  const parts = base.split('/').slice(0, -1);
+  for (const bit of raw.split('/')) { if (bit === '..') { if (!parts.length) return ''; parts.pop(); } else if (bit && bit !== '.') parts.push(bit); }
+  return parts.join('/');
+}
+const nodes = (doc, name) => [...doc.getElementsByTagNameNS('*', name)];
+const xml = (text, Parser) => { const doc = new Parser().parseFromString(text, 'application/xml'); if (nodes(doc, 'parsererror').length) throw Error('电子书目录格式不完整'); return doc; };
+const raster = path => /\.(?:png|jpe?g|gif|webp|avif)$/i.test(path);
+export function sanitizeBook(html, path, Parser = globalThis.DOMParser) {
+  const doc = new Parser().parseFromString(html, 'text/html');
+  const images = [];
+  const allowed = new Set(['p','div','span','h1','h2','h3','h4','h5','h6','em','strong','b','i','u','s','br','hr','blockquote','ul','ol','li','ruby','rt','rp','sub','sup']);
+  const walk = node => {
+    if (node.nodeType === 3) return escape(node.textContent);
+    if (node.nodeType !== 1) return '';
+    const tag = node.localName.toLowerCase();
+    if (['script','style','iframe','object','embed','form','link','meta','audio','video'].includes(tag)) return '';
+    if (tag === 'img' || tag === 'image') {
+      const src = bookPath(path, node.getAttribute('src') || node.getAttribute('href') || node.getAttribute('xlink:href'));
+      if (!raster(src)) return '';
+      images.push(src); return `<img data-book-image="${escape(src)}" alt="插图">`;
+    }
+    const children = [...node.childNodes].map(walk).join('');
+    return allowed.has(tag) ? `<${tag}>${children}${['br','hr'].includes(tag) ? '' : `</${tag}>`}` : children;
+  };
+  const clean = walk(doc.body), plain = new Parser().parseFromString(clean, 'text/html').body.textContent.trim();
+  return {html: clean, text: plain, images};
+}
+export function bookReadError(name, step, error) {
+  if (error.bookName) return error;
+  const detail = /Invalid type|ArrayBuffer/i.test(error.message || '') ? '浏览器读取文件时遇到数据兼容问题' : error.message || '文件格式不完整或无法读取';
+  return Object.assign(new Error(`「${name || '电子书'}」${step}失败：${detail}`, {cause: error}), {bookName: name});
+}
+const bookStep = async (name, step, run) => { try {return await run();} catch (error) {throw bookReadError(name, step, error);} };
+export async function openBook(blob, name, Parser = globalThis.DOMParser) {
+  return bookStep(name, '打开电子书', () => openBookData(blob, name, Parser));
+}
+async function openMarkdown(blob, name, Parser) {
+  // Reuse the bundled local Markdown renderer. Links and raw markup remain inert.
+  const {assistantMarkdown} = await import('../ui/assistant-markdown.js');
+  const source = decodeBook(await archiveBuffer(blob));
+  const body = new Parser().parseFromString(assistantMarkdown(source), 'text/html').body;
+  const chapters = [];
+  let current, length = 0;
+  for (const node of body.children) {
+    const heading = /^H[12]$/.test(node.tagName);
+    if (!current || heading || length >= 16000) {
+      current = {title: heading ? node.textContent : current?.title || '正文', blocks: []};
+      chapters.push(current);
+      length = 0;
+    }
+    current.blocks.push(node);
+    length += node.textContent.length;
+  }
+  if (!chapters.length) throw Error('Markdown 文件没有可阅读的正文');
+  return {
+    title: body.querySelector('h1')?.textContent.trim() || bookTitle(name), author: '', type: 'novel',
+    estimatedPages: Math.max(1, Math.ceil(body.textContent.length / 500)), chapters: chapters.map(c => ({title: c.title})),
+    chapter: async i => ({html: chapters[i].blocks.map(n => n.outerHTML).join(''), text: chapters[i].blocks.map(n => n.textContent).join('\n'), images: []}),
+    image: async () => null
+  };
+}
+function archivedImage(files, name, path) {
+  return bookStep(name, `读取书内图片「${path}」`, async () => {
+    if (!raster(path) || !files.has(path)) return null;
+    const blob = await files.get(path).blob();
+    const type = fileExtension(path).slice(1).replace(/^jpg$/, 'jpeg');
+    return blob.slice(0, blob.size, 'image/' + type);
+  });
+}
+async function openBookData(blob, name, Parser) {
+  const ext = fileExtension(name);
+  if (ext === '.md' || ext === '.markdown') return openMarkdown(blob, name, Parser);
+  if (ext === '.txt') {
+    const chapters = txtChapters(decodeBook(await archiveBuffer(blob)));
+    return {title: name.replace(/\.txt$/i, ''), author: '', type: 'novel', estimatedPages: Math.max(1, Math.ceil(chapters.reduce((sum,c) => sum + c.text.length, 0) / 500)), chapters: chapters.map(c => ({title: c.title})),
+      chapter: async i => ({html: chapters[i].text.split('\n').map(t => `<p>${escape(t) || '<br>'}</p>`).join(''), text: chapters[i].text, images: []}), image: async () => null};
+  }
+  const files = await readZipBlob(blob, {cache: false, verify: true});
+  const image = path => archivedImage(files, name, path);
+  if (ext === '.cbz' || ext === '.zip') {
+    const pages = [...files.keys()].filter(path => visibleEntry(path) && raster(path)).sort(naturalCompare);
+    if (!pages.length) throw Error('漫画压缩包里没有支持的图片');
+    return {
+      title: bookTitle(name), author: '', type: 'comic', cover: pages[0], image, estimatedPages: pages.length,
+      chapters: pages.map((path, i) => ({title: path.split('/').pop(), source: i, image: path})),
+      chapter: async i => ({html: `<img data-book-image="${escape(pages[i])}" alt="漫画页">`, text: '', images: [pages[i]]})
+    };
+  }
+  const read = path => bookStep(name, `读取书内文件「${path}」`, async () => { const f = files.get(path); if (!f || f.size > 16 * 1024 * 1024) throw Error('电子书章节缺失或过大'); return new TextDecoder().decode(await archiveBuffer(await f.blob())); });
+  const container = xml(await read('META-INF/container.xml'), Parser), opfPath = nodes(container, 'rootfile')[0]?.getAttribute('full-path');
+  const opf = xml(await read(opfPath), Parser), manifest = new Map(nodes(opf, 'item').map(n => [n.getAttribute('id'), {path: bookPath(opfPath, n.getAttribute('href')), properties: n.getAttribute('properties') || '', mime: n.getAttribute('media-type')} ]));
+  const chapters = nodes(opf, 'itemref').filter(n => n.getAttribute('linear') !== 'no').map(n => manifest.get(n.getAttribute('idref'))).filter(Boolean).map((n, i) => ({...n, title: `第 ${i + 1} 节`}));
+  if (!chapters.length) throw Error('电子书没有可阅读的章节');
+  let toc = [];
+  const nav = [...manifest.values()].find(n => n.properties.split(/\s+/).includes('nav'));
+  const ncx = [...manifest.values()].find(n => n.mime === 'application/x-dtbncx+xml');
+  if (nav) {
+    const doc = xml(await read(nav.path), Parser), section = nodes(doc, 'nav').find(n => /toc/.test(n.getAttribute('epub:type') || n.getAttribute('type') || '')) || doc;
+    toc = nodes(section, 'a').map(n => ({title: n.textContent.trim(), path: bookPath(nav.path, n.getAttribute('href'))}));
+  } else if (ncx) {
+    toc = nodes(xml(await read(ncx.path), Parser), 'navPoint').map(n => ({title: nodes(n, 'text')[0]?.textContent.trim(), path: bookPath(ncx.path, nodes(n, 'content')[0]?.getAttribute('src'))}));
+  }
+  for (const c of chapters) c.title = toc.find(t => t.path === c.path)?.title || c.title;
+  const chapter = i => bookStep(name, `读取章节「${chapters[i]?.title || i + 1}」`, async () => sanitizeBook(await read(chapters[i].path), chapters[i].path, Parser));
+  const sample = await Promise.all(chapters.slice(0, 5).map((_, i) => chapter(i)));
+  const fixed = nodes(opf, 'meta').some(n => n.getAttribute('property') === 'rendition:layout' && n.textContent.trim() === 'pre-paginated');
+  const comic = fixed || sample.every(c => c.images.length > 0 && c.text.length < 100);
+  const coverId = nodes(opf, 'meta').find(n => n.getAttribute('name') === 'cover')?.getAttribute('content');
+  const cover = manifest.get(coverId)?.path || [...manifest.values()].find(n => n.properties.split(/\s+/).includes('cover-image'))?.path || (comic ? sample[0].images[0] : '');
+  // Project the sampled visible text onto uncompressed spine documents only (exclude images, fonts and audio).
+  const spineBytes = chapters.reduce((sum,c) => sum + (files.get(c.path)?.size || 0), 0);
+  const sampleBytes = chapters.slice(0,sample.length).reduce((sum,c) => sum + (files.get(c.path)?.size || 0), 0);
+  const letters = sample.reduce((sum,c) => sum + c.text.length, 0);
+  const estimatedPages = comic ? Math.round(chapters.length * sample.reduce((sum,c) => sum + c.images.length, 0) / sample.length)
+    : Math.ceil(spineBytes * (letters ? letters / Math.max(1,sampleBytes) : .22) / 500);
+  return {title: nodes(opf, 'title')[0]?.textContent.trim() || name.replace(/\.epub$/i, ''), author: nodes(opf, 'creator').map(n => n.textContent.trim()).join('、'), type: comic ? 'comic' : 'novel', estimatedPages: Math.max(1,estimatedPages), chapters, cover, chapter, image};
+}
+export async function bookImports(files) {
+  const out = [];
+  for (const file of files) {
+    const direct = {name: file.name, open: async () => file};
+    if (bookExtensions.includes(fileExtension(file.name))) out.push(direct);
+    else if (fileExtension(file.name) === '.zip') {
+      let entries;
+      try { entries = await bookStep(file.name, '读取书籍压缩包', () => readZipBlob(file, {cache: false, verify: true})); }
+      catch (error) { out.push({name: file.name, open: async () => { throw error; }}); continue; }
+      const paths = [...entries.keys()].filter(visibleEntry);
+      const books = paths.filter(path => bookExtensions.includes(fileExtension(path)));
+      if (books.length) {
+        for (const path of books) out.push({name: path.split('/').pop(), open: entries.get(path).blob});
+      } else if (paths.some(raster)) out.push(direct);
+    }
+  }
+  return out;
+}
+/** Book titles in the order people number them (0.9.49): 第2卷 before 第10卷, Vol.9 before Vol.10. */
+const NATURAL = typeof Intl !== 'undefined' ? new Intl.Collator('zh-Hans-CN', {numeric: true, sensitivity: 'base'}) : null;
+export const naturalCompare = (a, b) => NATURAL ? NATURAL.compare(String(a), String(b)) : String(a).localeCompare(String(b));
+/**
+ * The series a book belongs to, from its name (0.9.49): 「黑执事 第3卷」「黑执事 Vol.03」「黑执事_03」 are all 「黑执事」.
+ * '' when the name has no number at its end to take off.
+ */
+export function seriesOf(name) {
+  const value = String(name || '').trim();
+  const ext = fileExtension(value);
+  const base = ext === '.zip' || bookExtensions.includes(ext) ? bookTitle(value).trim() : value;
+  const cut = base.replace(/[\s_\-—–·.]*[(（\[【]?\s*(?:第\s*[0-9０-９一二三四五六七八九十百零〇两]+\s*[卷册集话話部巻本期]|(?:vol(?:ume)?|v|#|no)\.?\s*[0-9０-９]+|[0-9０-９]+\s*[卷册集话話部巻]?)\s*[)）\]】]?\s*$/i, '').trim();
+  return cut && cut !== base ? cut.replace(/[\s_\-—–·.]+$/, '') : '';
+}
+export function readingPosition(value = {}, chapters = 1) {
+  return {chapter: Math.max(0, Math.min(chapters - 1, Math.trunc(Number(value.chapter) || 0))), fraction: Math.max(0, Math.min(1, Number(value.fraction) || 0))};
+}
+export function annotationDue(book, {now = Date.now(), random = Math.random()} = {}) {
+  const day = new Date(now).toLocaleDateString('sv-SE');
+  return book.settings?.annotations !== false && !!book.companion && (book.turns || 0) >= (book.nextNote || 6) && (book.daily?.day !== day || book.daily.count < 12) && random < .65;
+}
+
+// ---------- 阅读统计 (0.9.52) ----------
+const DAY = 86400000;
+/** A day as 「2026-11-09」 in this device's zone. */
+export const dayKey = at => {
+  const d = new Date(at), pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+/**
+ * What a book's reading time adds up to: sec (all time), days ({day: sec}, 120 kept), prog (progress added — what the
+ * speed is worked out from). Kept apart from the reading position, which the user can clear without losing the stats.
+ */
+export function normalizeStats(value = {}) {
+  const sec = Math.max(0, Math.round(Number(value?.sec) || 0)), prog = Math.max(0, Number(value?.prog) || 0), days = {};
+  if (value?.days && typeof value.days === 'object') for (const [k, v] of Object.entries(value.days)) if (/^\d{4}-\d{2}-\d{2}$/.test(k) && Number(v) > 0) days[k] = Math.round(Number(v));
+  const keys = Object.keys(days).sort();
+  for (const k of keys.slice(0, Math.max(0, keys.length - 120))) delete days[k];
+  return {sec, prog: Math.min(1e6, prog), days};
+}
+/** The stats after `seconds` more reading and `progress` (0…1 of the book) further on. Negative numbers add nothing. */
+export function addReadingTime(stats, seconds, {now = Date.now(), progress = 0} = {}) {
+  const out = normalizeStats(stats), sec = Math.max(0, Math.round(Number(seconds) || 0));
+  if (sec) { out.sec += sec; const day = dayKey(now); out.days[day] = (out.days[day] || 0) + sec; }
+  if (progress > 0) out.prog = Math.min(1e6, out.prog + Math.min(1, progress));
+  return normalizeStats(out);
+}
+export const todaySeconds = (stats, now = Date.now()) => normalizeStats(stats).days[dayKey(now)] || 0;
+/** The last seven days, oldest first: [{day, sec}] — for the little bar chart. */
+export function weekSeconds(stats, now = Date.now()) {
+  const s = normalizeStats(stats), out = [];
+  for (let i = 6; i >= 0; i--) { const key = dayKey(now - i * DAY); out.push({day: key, sec: s.days[key] || 0}); }
+  return out;
+}
+/** How much longer this book takes at the speed so far (seconds), or null when it is too early to tell or finished. */
+export function readingLeft(book, stats) {
+  const s = normalizeStats(stats), chapters = Math.max(1, book?.chapters?.length || 1);
+  const done = Math.min(1, Math.max(0, ((Number(book?.position?.chapter) || 0) + (Number(book?.position?.fraction) || 0)) / chapters));
+  if (s.sec < 20 || s.prog <= 0.0005 || done >= .999) return null;
+  const left = (1 - done) / (s.prog / s.sec);
+  return Number.isFinite(left) && left > 0 ? Math.round(Math.min(left, 1e7)) : null;
+}
+/** 「1 小时 20 分」／「18 分钟」／「不到 1 分钟」. */
+export function span(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  if (!s) return '';
+  if (s < 60) return '不到 1 分钟';
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} 分钟`;
+  const h = Math.floor(m / 60), rest = m % 60;
+  return rest ? `${h} 小时 ${rest} 分` : `${h} 小时`;
+}
+
+// ---------- 书摘和批注 (0.9.52) ----------
+export const HIGHLIGHT_MAX = 500, ANNOTATION_MAX = 500;
+const cleanText = (value, most) => String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, most);
+/**
+ * A 书摘: {id, chapter, para, text, at}. The paragraph is the nth block of the chapter (`data-para`), so it stays on
+ * the right lines when the page is laid out again; the first words are kept to find it again if the book changed.
+ */
+export function normalizeHighlights(list) {
+  const out = [], seen = new Set();
+  for (const h of Array.isArray(list) ? list : []) {
+    const text = typeof h?.text === 'string' && Number.isInteger(h.start) ? h.text : cleanText(h?.text, 600), chapter = Math.trunc(Number(h?.chapter)), para = Math.trunc(Number(h?.para));
+    if (!text || !Number.isFinite(chapter) || !Number.isFinite(para) || chapter < 0 || para < 0) continue;
+    const ranged = Number.isInteger(h.start) && Number.isInteger(h.end) && Number.isInteger(h.endPara);
+    const key = [chapter, para, ...(ranged ? [h.start,h.endPara,h.end] : [])].join(':');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({id: String(h?.id || `h:${key}`), chapter, para, ...(ranged ? {start:h.start,end:h.end,endPara:h.endPara} : {}), text, at: Number(h?.at) || Date.now()});
+  }
+  return out.slice(-HIGHLIGHT_MAX);
+}
+/** Adds a 书摘, or takes it off again when that paragraph is already picked — what the long-press menu does. */
+export function toggleHighlight(list, selection) {
+  const rows = normalizeHighlights(list), [entry] = normalizeHighlights([selection]);
+  if (!entry) return rows;
+  const found = rows.find(h => h.chapter === entry.chapter && h.para === entry.para && h.start === entry.start && h.endPara === entry.endPara && h.end === entry.end);
+  return found ? rows.filter(h => h !== found) : normalizeHighlights([...rows, entry]);
+}
+export const highlighted = (list, chapter, para) => normalizeHighlights(list).some(h => h.chapter === Number(chapter) && h.para === Number(para));
+
+/** A note in the page: {id, chapter, para, text, who, at}. `para` is where it is tucked in (after that paragraph). */
+export function normalizeAnnotations(list) {
+  const out = [];
+  for (const n of Array.isArray(list) ? list : []) {
+    const text = cleanText(n?.text, 200), chapter = Math.trunc(Number(n?.chapter));
+    if (!text || !Number.isFinite(chapter) || chapter < 0) continue;
+    const para = Math.max(0, Math.trunc(Number(n?.para)) || 0);
+    out.push({id: String(n?.id || crypto.randomUUID()), chapter, para, ...(Number.isInteger(n.offset) ? {offset:n.offset} : {}), text, who: cleanText(n?.who, 40), at: Number(n?.at) || Date.now()});
+  }
+  return out.slice(-ANNOTATION_MAX);
+}
+export class BookshelfStore {
+  constructor(scope, options = {}) {
+    this.meta = new AppStore(scope, {...options, database: 'st-iphonie-bookshelf-v1'});
+    this.files = new AppStore(scope, {...options, database: 'st-iphonie-bookshelf-files-v1'});
+  }
+  list() { return this.meta.list('reading'); }
+  get(id) { return this.meta.get(id); }
+  async blob(id) { return (await this.files.get(id))?.blob || null; }
+  async add(data, blob, cover) {
+    const id = 'reading:' + crypto.randomUUID(), at = Date.now();
+    await this.files.put([{id, kind: 'reading-file', at, blob, cover}]);
+    const row = {...data, id, kind: 'reading', at, size: blob.size, position: readingPosition(), settings: {...readerDefaults}, bookmarks: [], annotations: [], turns: 0};
+    try { await this.meta.put([row]); } catch (e) { await this.files.remove(id); throw e; }
+    return row;
+  }
+  async update(id, patch) {
+    return this.meta.change(id, row => {
+      for (const key of ['estimatedPages','companion','settings','bookmarks','annotations','turns','nextNote','daily','shelf','lastRead','chapters','stats','highlights']) if (key in patch) row[key] = structuredClone(patch[key]);
+      if (patch.settingsPatch) row.settings = {...row.settings, ...structuredClone(patch.settingsPatch)};
+      if (patch.illustration?.photoId) {
+        const {version, ...pic} = structuredClone(patch.illustration);
+        const images = row.illustrations ||= [];
+        const previous = images.find(item => (item.id || item.photoId) === (pic.id || pic.photoId));
+        const versions = previous?.versions || (previous ? [{photoId:previous.photoId}] : []);
+        if (!versions.some(v => v.photoId === pic.photoId)) versions.push({...version, photoId:pic.photoId});
+        if (previous) Object.assign(previous,pic,{versions});
+        else images.push({...pic,versions});
+      }
+      if (patch.pickIllustration) {
+        const {id,photoId} = patch.pickIllustration;
+        const pic = row.illustrations?.find(item => (item.id || item.photoId) === id);
+        if (pic?.versions?.some(v => v.photoId === photoId)) pic.photoId = photoId;
+      }
+      if (patch.position) row.position = readingPosition(patch.position, row.chapters.length);
+      if ('stats' in patch) row.stats = normalizeStats(row.stats);
+      if ('highlights' in patch) row.highlights = normalizeHighlights(row.highlights);
+      if ('annotations' in patch) row.annotations = normalizeAnnotations(row.annotations);
+    });
+  }
+  /** 多选 (0.9.52): the same change on several books at once (a category, say). */
+  async updateMany(ids, patch) {
+    const out = [];
+    for (const id of ids || []) out.push(await this.update(String(id), patch).catch(error => ({error})));
+    return out.filter(x => x && !x.error);
+  }
+  async remove(id) { await this.meta.remove(id); await this.files.remove(id); }
+  /** 多选删除: the books and their files go; one failing does not stop the rest. */
+  async removeMany(ids) {
+    let gone = 0;
+    for (const id of ids || []) { try { await this.remove(String(id)); gone++; } catch { /* keep going */ } }
+    return gone;
+  }
+  close() { this.meta.close(); this.files.close(); }
+}

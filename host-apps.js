@@ -1,0 +1,203 @@
+import {readStoryLines} from './story-exact.js';
+// 论坛 and 查手机, tavern side. Like 朋友圈, they are generated apart from the story with the tavern's connected model (or
+// the phone's own text model) and nothing is written into the story. One model request per app at a time.
+import {currentDm} from './core/chats.js';
+import {buildForumRequest, parseForum, postLines} from './core/forum.js';
+import {buildPeekRequest, parsePeek, peekId, mergePeek, sharedPeekChats, keepSharedPeek} from './core/peek.js';
+import {findRoute, roleStore} from './core/routes.js';
+import {pickCrowd, activityNames} from './core/moments.js';
+import {inSpace, activeChatPreset, cleanTagged} from './core/chat.js';
+import {worldInfoFor, loreOptions} from './host-lore.js';
+import {pictureInputs, sizeFor, photoPicture} from './core/draw.js';
+
+const PEOPLE = 12;
+
+export function createAppsHost({context, settings, backend, memory = null, notice = () => {}}) {
+  const busy = {forum: null, peek: null}, pending = new Map();
+  const userName = () => context()?.name1 || '我';
+  const userPersona = () => String(context()?.powerUserSettings?.persona_description || '').slice(0, 1500);
+  function card(name) {
+    const c = context()?.characters?.find(ch => ch?.name === name);
+    if (!c) return '';
+    return [c.description, c.personality && '性格：' + c.personality].filter(Boolean).join('\n')
+      .replaceAll('{{char}}', name).replaceAll('{{user}}', userName()).slice(0, 1500);
+  }
+  /** Everyone who can post here; a forum request names at most PEOPLE of them (pick). */
+  const people = () => backend.crowd().map(c => ({name: c.name, persona: c.persona, card: c.persona ? '' : card(c.name)}));
+  /** The forum's posts here, newest first. */
+  const feed = async () => (await backend.apps.list('forum')).filter(p => inSpace(p, backend.here()));
+  /** Who this request names: everyone when they fit, else a turn of them (core/moments.js pickCrowd). */
+  const pick = (everyone, story, posts, must = []) => pickCrowd(everyone, {limit: PEOPLE, must: must.filter(n => n && n !== 'me'), story, active: activityNames(posts.slice(0, 40))});
+  const lore = (preset, crowd, story, texts) => preset.lore === false ? Promise.resolve('') : worldInfoFor(context, {...loreOptions(preset), report: (...args) => backend.reportDiagnostic?.(...args), persona: userPersona(), characters: crowd.map(p => p.persona || p.card).join('\n'),
+    texts: [...story.map(r => `${r.name}: ${r.text}`), ...texts], always: [crowd.map(p => p.name).join('、')]});
+  async function ask(ctx, prompt, preset, use) {
+    return cleanTagged(String(await backend.generateText(ctx, {prompt, trimNames: false, use}) || ''), preset.cleanTags);
+  }
+  /** One request per app at a time; the phone shows it as busy. */
+  function run(app, key, task) {
+    if (pending.has(key)) return pending.get(key);
+    const previous = busy[app], ctx = context(), valid = backend.spaceGuard?.() || (() => true);
+    const result = (previous ? previous.catch(() => {}) : Promise.resolve()).then(() => {
+      if (!valid()) throw Error('酒馆聊天已切换，请回原聊天重试');
+      return task(ctx);
+    });
+    const next = result.finally(() => { pending.delete(key); if (busy[app] === next) busy[app] = null; backend.emit(app, {busy: !!busy[app]}); });
+    pending.set(key, next); busy[app] = next; backend.emit(app, {busy: true});
+    return next;
+  }
+  const base = () => {
+    const s = settings(), preset = activeChatPreset(s.chat);
+    return {s, preset, everyone: people(), user: userName()};
+  };
+
+  // ---------- 论坛 ----------
+  /** 网名 on the forum: {me: the user's, name: a character's}. */
+  const netNames = () => ({...(settings().chat?.netNames || {})});
+  /** Screen names the model made up for characters who had none: kept, so they stay the same. */
+  async function keepNames(names, crowd) {
+    const have = netNames(), fresh = Object.fromEntries(Object.entries(names || {}).filter(([name]) => name !== 'me' && !have[name] && crowd.some(c => c.name === name)));
+    if (Object.keys(fresh).length) try { backend.saveChatOptions({netNames: fresh}); } catch { /* made up again next time */ }
+  }
+  /** New posts and the 热搜. */
+  function forumRefresh({auto=false}={}) {
+    return run('forum', 'forum:refresh', async ctx => {
+      backend.assertSpaceReady();const valid=auto?backend.spaceGuard():()=>true;
+      // The card asked for: the tavern may move to another one while the model writes.
+      const space = backend.cardKey(), save = backend.saveKey(), hotId = backend.hotId(), {preset, everyone, user} = base(), handles = netNames();
+      const posts = await feed(), recent = posts.slice(0, 8), hot = (await backend.apps.get(hotId))?.topics || [];
+      const story = await readStoryLines(ctx.chat, preset, user, settings().narration), crowd = pick(everyone, story, posts);
+      const prompt = buildForumRequest({prompts: settings().promptRules, preset, handles, earlier: memory?.storyMemory() || '', mode: 'posts', people: crowd, story, user, userPersona: userPersona(), recent, hot, lore: await lore(preset, crowd, story, [...hot, ...recent.map(p => p.title)])});
+      const found = parseForum(await ask(ctx, prompt, preset, 'forum'), {user, mode: 'posts', handles});
+      if(!valid())throw Error('酒馆聊天已切换，这次论坛刷新没有写入');
+      await keepNames(found.names, crowd);
+      if(!valid())throw Error('酒馆聊天已切换，这次论坛刷新没有写入');
+      if (!found.posts.length) throw Error('这次没有刷出新帖子，可以再刷新一次');
+      if (found.hot.length) await backend.setForumHot(found.hot, hotId);
+      if(!valid())throw Error('酒馆聊天已切换，这次论坛刷新没有写入');
+      return backend.addForumPosts(found.posts, {space, save,source:'auto',autoBatch:auto?crypto.randomUUID():''});
+    });
+  }
+  /** Replies to the user's new post. */
+  function forumReact(postId) {
+    return run('forum', `forum:react:${postId}`, async ctx => {
+      const {preset, everyone, user} = base(), handles = netNames();
+      const post = await backend.apps.get(postId);
+      if (!post) throw Error('这个帖子已经不在了');
+      const story = await readStoryLines(ctx.chat, preset, user, settings().narration), crowd = pick(everyone, story, await feed());
+      const prompt = buildForumRequest({prompts: settings().promptRules, preset, handles, earlier: memory?.storyMemory() || '', mode: 'react', people: crowd, story, user, userPersona: userPersona(), post, lore: await lore(preset, crowd, story, [postLines(post, user)])});
+      const found = parseForum(await ask(ctx, prompt, preset, 'forum'), {user, mode: 'react', handles});
+      await keepNames(found.names, crowd);
+      if (!found.replies.length) throw Error('这次没有人回复，可以再试一次');
+      return backend.addForumReplies(postId, found.replies);
+    });
+  }
+  /** Answers to the user's reply. */
+  function forumReply(postId, replyId) {
+    return run('forum', `forum:reply:${postId}:${replyId}`, async ctx => {
+      const {preset, everyone, user} = base(), handles = netNames();
+      const post = await backend.apps.get(postId), mine = post?.replies.find(r => r.id === replyId);
+      if (!post || !mine) throw Error('这条回复已经不在了');
+      // The post's author, whom the reply answers and who already spoke under it are in the answer's list.
+      const story = await readStoryLines(ctx.chat, preset, user, settings().narration), crowd = pick(everyone, story, await feed(), [post.author, mine.to, ...post.replies.map(r => r.from)]);
+      // Keep the topic in one scan unit: even a shallow scan needs the original question and recent discussion.
+      const discussion = postLines(post, user) + `\n本次回复${mine.to ? '（回复 ' + mine.to + '）' : ''}：${mine.text}`;
+      const prompt = buildForumRequest({prompts: settings().promptRules, preset, handles, earlier: memory?.storyMemory() || '', mode: 'reply', people: crowd, story, user, userPersona: userPersona(), post, reply: mine, lore: await lore(preset, crowd, story, [discussion])});
+      const found = parseForum(await ask(ctx, prompt, preset, 'forum'), {user, mode: 'reply', handles});
+      await keepNames(found.names, crowd);
+      if (!found.replies.length) throw Error('这次没有人接话，点这条回帖的 ⋯ → 重试');
+      return backend.addForumReplies(postId, found.replies);
+    });
+  }
+
+  // ---------- 查手机 ----------
+  /** Looks into a character's phone: a new snapshot, or (keep) what is new since last time put onto the old one. */
+  function peekLook(name, {keep = false} = {}) {
+    return run('peek', `peek:${name}:${keep}`, async ctx => {
+      const key = backend.spaceKey(), {preset, user} = base(), contact = backend.contacts().find(c => c.name === name);
+      if (!contact) throw Error(`联系人里没有「${name}」`);
+      const person = {name, persona: contact.persona, card: contact.persona ? '' : card(name)};
+      const thread = currentDm(await backend.threads(), name);
+      const history = thread ? (await backend.chats.get(thread.id)).messages.filter(m => m.kind !== 'system').slice(-20) : [];
+      const story = await readStoryLines(ctx.chat, preset, user, settings().narration);
+      const remembered = memory ? await memory.aboutPeople([name]).catch(() => '') : '';
+      let before = keep ? (await backend.apps.get(peekId(name, key))) || (key ? await backend.apps.get(peekId(name)) : null) : null;
+      const routes = backend.seen?.routes || settings().routes;
+      if (before?.ownerKey && before.ownerKey !== (roleStore(findRoute(routes, name)) || name)) before = null;
+      const snapshots = (await backend.apps.list('peek')).filter(p => (p.space || '') === key);
+      const shared = sharedPeekChats(name, snapshots, routes);
+      const prompt = buildPeekRequest({prompts: settings().promptRules, preset, before, earlier: memory?.storyMemory() || '', person, story, user, userPersona: userPersona(), history, memory: remembered, images: !!backend.drawReady(), lore: await lore(preset, [person], story, history.map(m => m.text || ''))});
+      if (shared.length) prompt[0].content += '\n【双方已看到的共同聊天，保持原样，不要重写】\n' + shared.map(c => `【聊天】${c.with}\n${c.lines.map(l => `${l.from}：${l.text}`).join('\n')}`).join('\n');
+      const found = parsePeek(await ask(ctx, prompt, preset, 'peek'), {name, user});
+      for (const c of found.chats) {
+        c.with = findRoute(routes, c.with)?.name || c.with;
+        c.withKey = roleStore(findRoute(routes, c.with)) || c.with;
+      }
+      return backend.savePeek({name, ...keepSharedPeek(mergePeek(before, found), shared), ownerKey: roleStore(findRoute(routes, name)) || name}, key);
+    });
+  }
+
+  /** Draws one photo of a character's album (index 'wallpaper': their wallpaper, upright). Without allowPaid, only when
+   *  the free tier covers it. */
+  const drawing = new Map();
+  async function peekDraw(name, index, {allowPaid = false, prompt, version, replacement, expected} = {}) {
+    const valid=backend.spaceGuard?.() || (()=>true),space=backend.spaceKey();
+    const snap=(await backend.apps.get(peekId(name,space))) || (space ? await backend.apps.get(peekId(name)) : null),id=snap?.id;
+    const wall=index==='wallpaper',pick=doc=>wall?doc.wallpaper:doc.photos?.[index],photo=snap && structuredClone(pick(snap));
+    if(!photo || !valid())throw Error('这张照片已经不在当前手机里');
+    if(expected && (expected.id!==id || expected.at!==snap.at || expected.text!==photo.text || expected.tags!==photo.tags))throw Error('手机内容已变化，请重新打开图片');
+    const key=id+':'+snap.at+':'+index;
+    const set=patch=>backend.appsMutate('peek',()=>backend.apps.change(id,doc=>{
+      const target=pick(doc);
+      if(!valid() || doc.at!==snap.at || !target || target.tags!==photo.tags || target.text!==photo.text || target.photoId!==photo.photoId)throw Error('手机内容已经更新，生成的图片保留在相册，没有覆盖原图');
+      Object.assign(target,patch);
+    }));
+    const versions=[...new Set([...(photo.imageVersions||[]),photo.photoId].filter(Boolean))];
+    if(replacement!==undefined){
+      if(drawing.has(key) || !await backend.library.getPhoto(replacement)) throw Error('图片不可用或正在重画');
+      await set({photoId:replacement,imageVersions:[...new Set([...versions,replacement])].slice(-100),state:'done'});return replacement;
+    }
+    if(version!==undefined){
+      if(drawing.has(key))throw Error('正在重画，请稍后再选版本');
+      if(!versions.includes(version))throw Error('这版图片已经不在了');
+      await set({photoId:version});return version;
+    }
+    if(drawing.has(key))return drawing.get(key);
+    const tags=prompt===undefined?photo.tags:String(prompt).trim().slice(0,6000);
+    if(!tags)throw Error('这张照片还没有画图用的提示词');
+    if(!backend.drawReady())throw Error(backend.drawMissing()+'，相册只能看文字');
+    const work=(async()=>{
+      try {
+        await set({state:'waiting',note:''});
+        const names=[...settings().routes.map(r=>r.name),userName()],picture=photoPicture(settings(),{text:photo.text,tags,owner:name,names});
+        const input=pictureInputs(settings(),picture,'');
+        if(wall){const up=sizeFor(input.params,'竖'),side=up.width,snap64=n=>Math.max(64,Math.round(n/64)*64);input.params={...input.params,...(up.width===up.height?{width:snap64(side*.8125),height:snap64(side*1.1875)}:up)};}
+        if(!valid())throw Error('聊天已切换，旧的重绘任务已停止');
+        const result=await backend.generateImage({...input,allowPaid,name:'查手机-'+name,key:'peek:'+name+':'+index,label:'查手机 · '+name+(wall?' · 壁纸':'')});
+        await set({photoId:result.photoId,imageVersions:[...new Set([...versions,result.photoId])].slice(-100),tags,state:'done',note:''});
+        return result.photoId;
+      }catch(error){await set({state:'failed',note:error.code==='PAID'?backend.paidPrompt().note:String(error.message).slice(0,200)}).catch(()=>{});throw error;}
+    })();
+    drawing.set(key,work);try{return await work;}finally{if(drawing.get(key)===work)drawing.delete(key);}
+  }
+
+  let autoChecking=false;
+  const counters=new Map();
+  async function storyReplied(id) {
+    const opts=settings().forum||{};
+    if(!opts.auto){counters.clear();return;}
+    const ctx=context(),message=ctx?.chat?.[id];
+    if(!Number.isInteger(id)||!message||message.is_user||message.is_system||!String(message.mes||'').trim()||backend.here()?.pending)return;
+    const key=JSON.stringify([backend.cardKey(),backend.saveKey()]),count=counters.get(key)||{since:0,seen:new Set()};
+    counters.set(key,count);if(counters.size>50)counters.delete(counters.keys().next().value);
+    if(count.seen.has(message))return;count.seen.add(message);if(count.seen.size>200)count.seen.delete(count.seen.values().next().value);
+    count.since++;if(count.since<opts.every||busy.forum||autoChecking)return;
+    autoChecking=true;const valid=backend.spaceGuard();
+    try{
+      if(await backend.forumAutoToday()>=opts.dailyMax||!valid()||busy.forum)return;
+      count.since=0;const posts=await forumRefresh({auto:true});
+      if(posts?.length&&valid())notice('论坛有了 '+posts.length+' 个新帖子');
+    }catch(error){backend.reportDiagnostic?.('论坛自动刷新',error.message||String(error),'warn');}
+    finally{autoChecking=false;}
+  }
+  return {forumRefresh, forumReact, forumReply, storyReplied, peekLook, peekDraw, busy: app => !!busy[app]};
+}
