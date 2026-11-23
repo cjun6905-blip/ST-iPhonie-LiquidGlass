@@ -234,7 +234,8 @@ class DrawSettings {
         if ('grid' in patch) draw.grid = normalizeGrid(clone(patch.grid));
         if ('positionGrid' in patch) draw.positionGrid = normalizePositionGrid(clone(patch.positionGrid));
         if ('maskLook' in patch) draw.maskLook = normalizeMaskLook({ ...draw.maskLook, ...clone(patch.maskLook) });
-        for (const key of ['enabled', 'auto', 'guard', 'fold', 'strip', 'stream', 'autoDownload', 'selectionDraw']) if (key in patch) { if (typeof patch[key] !== 'boolean') throw Error('开关设置无效'); draw[key] = patch[key]; }
+        for (const key of ['enabled', 'auto', 'guard', 'skipPaidConfirm', 'fold', 'strip', 'stream', 'autoDownload', 'selectionDraw']) if (key in patch) { if (typeof patch[key] !== 'boolean') throw Error('开关设置无效'); draw[key] = patch[key]; }
+        if ('placement' in patch) { if (!['anchor', 'bottom'].includes(patch.placement)) throw Error('插图位置无效'); draw.placement = patch.placement; }
         if ('storyPaidSource' in patch) {
             if (patch.storyPaidSource !== '' && patch.storyPaidSource !== storyDrawSource(draw)) throw Error('绘图连接已变化，请重新确认');
             draw.storyPaidSource = patch.storyPaidSource;

@@ -139,6 +139,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
     if (engine === 'nai') try { await backend.naiSubscription(); } catch (error) { const relay = settings().draw.relay; if (!relay.url&&interactive)notice(error.message);else backend.reportDiagnostic?.('绘图订阅查询',{message:error.message,drawStillAvailable:true},'warn'); }
     const quote = backend.drawQuote(params);
     if (quote.free === true) return 'free';
+    if (!who && settings().draw?.skipPaidConfirm === true) return 'paid';
     if (!interactive) return false;
     const why = (who ? `「${who}」想用小手机画一张图。\n` : '') + (engine === 'gpt' ? 'GPT 生图每张都要花钱（按 OpenAI 或中转的价格）。' : quote.free === null ? '暂时读不到 NovelAI 订阅信息，无法确认是否免费。' : '按当前参数和订阅，这张图会扣 Anlas。');
     return globalThis.confirm(why + '\n确定要生成吗？') ? 'paid' : false;
@@ -447,7 +448,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
     const tags = allPictures(message).filter(tag => !stored(message, tag.hash));
     if (!tags.length) return;
     const source = storyDrawSource(s.draw);
-    const authorized = () => !!source && settings().draw.storyPaidSource === source && storyDrawSource(settings().draw) === source;
+    const authorized = () => settings().draw?.skipPaidConfirm === true || (!!source && settings().draw.storyPaidSource === source && storyDrawSource(settings().draw) === source);
     const valid = () => current() && canDraw() && settings().draw.enabled && settings().draw.auto && storyDrawSource(settings().draw) === source;
     // Subscription lookup can be asynchronous. Recheck the exact branch and connection before queueing.
     if (!backend.drawReady()) return;
@@ -496,7 +497,7 @@ export function createPictureHost({context, redrawMessage = (id, message) => con
     const waiting = state === 'generating' ? queueText(key) : '';
     const quote = state === 'idle' && s.draw.auto && backend.drawReady() ? backend.drawQuote?.(pictureInputs(s,tag,message.mes).params) : null;
     const reason = state === 'idle' ? (!s.draw.enabled ? '正文出图没有开启' : !backend.drawReady() ? backend.drawMissing() : !s.draw.auto ? '自动出图已关闭' : s.draw.engine === 'gpt' ? 'GPT 生图每张都要花钱' : quote?.free === false || quote?.paid ? '这张图预计会扣点' : quote?.free === null ? '当前连接无法确认免费额度' : '这张图没有自动生成') : '';
-    const paidSource = state === 'idle' && s.draw.enabled && s.draw.auto && backend.drawReady() &&
+    const paidSource = state === 'idle' && s.draw.enabled && s.draw.auto && !s.draw.skipPaidConfirm && backend.drawReady() &&
       (s.draw.engine === 'gpt' || quote?.free === false || quote?.free === null) ? storyDrawSource(s.draw) : '';
     const signature = JSON.stringify([paidSource, state, pic?.url, pic?.count, folded, waiting, job?.message, reason]);
     if (el.dataset.stttsRendered === signature) return;

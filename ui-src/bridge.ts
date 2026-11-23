@@ -9,6 +9,7 @@ export type AppId =
   | 'gallery'
   | 'roles'
   | 'engines'
+  | 'logs'
   | 'settings';
 
 export type WallpaperId = 'aurora' | 'ocean' | 'twilight' | 'pearl' | 'obsidian';
@@ -333,7 +334,7 @@ export const usePhoneStore = defineStore('phone', () => {
       const wantApp = api.takeApp?.();
       if (wantApp) {
         if (wantApp === 'chat:moments') openApp('moments');
-        else if (['chat', 'moments', 'peek', 'draw', 'gallery', 'roles', 'engines', 'settings'].includes(wantApp)) {
+        else if (['chat', 'moments', 'peek', 'draw', 'gallery', 'roles', 'engines', 'logs', 'settings'].includes(wantApp)) {
           openApp(wantApp as AppId);
         }
       }
@@ -352,7 +353,7 @@ export const usePhoneStore = defineStore('phone', () => {
   (window as any).stTtsOpenApp = () => {
     const wantApp = api.takeApp?.();
     if (wantApp === 'chat:moments') openApp('moments');
-    else if (wantApp && ['chat', 'moments', 'peek', 'draw', 'gallery', 'roles', 'engines', 'settings'].includes(wantApp)) {
+    else if (wantApp && ['chat', 'moments', 'peek', 'draw', 'gallery', 'roles', 'engines', 'logs', 'settings'].includes(wantApp)) {
       openApp(wantApp as AppId);
     }
   };

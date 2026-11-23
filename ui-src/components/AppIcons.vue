@@ -11,6 +11,7 @@ const gradients: Record<AppId, [string, string]> = {
   gallery: ['#38bdf8', '#2563eb'],
   roles: ['#fbbf24', '#ea580c'],
   engines: ['#2dd4bf', '#0284c7'],
+  logs: ['#60a5fa', '#1d4ed8'],
   settings: ['#94a3b8', '#475569'],
 };
 </script>
@@ -74,6 +75,12 @@ const gradients: Record<AppId, [string, string]> = {
       <rect x="4" y="4" width="16" height="16" rx="3" />
       <rect x="9" y="9" width="6" height="6" rx="1" fill="currentColor" stroke="none" />
       <path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3" />
+    </svg>
+
+    <!-- Logs -->
+    <svg v-else-if="id === 'logs'" class="w-7 h-7 text-white drop-shadow-sm relative z-10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="4" y="3" width="16" height="18" rx="3" />
+      <path d="M8 8h8M8 12h8M8 16h5" />
     </svg>
 
     <!-- Settings -->

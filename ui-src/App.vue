@@ -15,6 +15,7 @@ const appComponents: Record<AppId, ReturnType<typeof defineAsyncComponent>> = {
   gallery: defineAsyncComponent(() => import('@/apps/GalleryApp.vue')),
   roles: defineAsyncComponent(() => import('@/apps/RolesApp.vue')),
   engines: defineAsyncComponent(() => import('@/apps/EnginesApp.vue')),
+  logs: defineAsyncComponent(() => import('@/apps/LogsApp.vue')),
   settings: defineAsyncComponent(() => import('@/apps/SettingsApp.vue')),
 };
 
@@ -26,6 +27,7 @@ const gridApps: Array<{ id: AppId; label: string }> = [
   { id: 'gallery', label: '相册' },
   { id: 'roles', label: '角色' },
   { id: 'engines', label: '引擎' },
+  { id: 'logs', label: '日志' },
   { id: 'settings', label: '设置' },
 ];
 

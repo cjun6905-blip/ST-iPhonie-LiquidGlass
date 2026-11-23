@@ -96,6 +96,14 @@ const wallpapers: Array<{ id: WallpaperId; label: string }> = [
           <button class="lg-switch" :data-on="draw.auto !== false" @click="patchDraw({ auto: draw.auto === false })" />
         </div>
 
+        <div class="flex items-center justify-between">
+          <div>
+            <div class="text-xs font-medium">跳过 GPT / 扣点生图确认</div>
+            <div class="text-[10.5px] opacity-60">开启后 GPT 生图与付费中转直接出图，不再弹窗确认</div>
+          </div>
+          <button class="lg-switch" :data-on="!!draw.skipPaidConfirm" @click="patchDraw({ skipPaidConfirm: !draw.skipPaidConfirm })" />
+        </div>
+
         <div class="space-y-1.5">
           <div class="text-xs font-medium">插图展示位置</div>
           <div class="grid grid-cols-2 gap-1.5 p-1 rounded-2xl bg-black/10 dark:bg-white/10 text-xs">
@@ -178,8 +186,8 @@ const wallpapers: Array<{ id: WallpaperId; label: string }> = [
           </div>
           <button class="lg-switch" :data-on="!!sync.enabled" @click="toggleSync" />
         </div>
-        <button class="lg-pill w-full py-2 rounded-2xl text-xs font-medium cursor-pointer" @click="openLogs">
-          查看最近请求日志
+        <button class="lg-pill w-full py-2 rounded-2xl text-xs font-medium cursor-pointer" @click="store.openApp('logs')">
+          打开完整请求日志 App
         </button>
       </section>
     </div>

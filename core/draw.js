@@ -359,7 +359,7 @@ export function storyDrawSource(draw) {
   return JSON.stringify([engine,draw.connections?.[engine]?.active || 'default',engine === 'nai' ? draw.relay?.url || '' : draw.gpt?.url || '']);
 }
 export function defaultDraw() {
-  return {enabled: false, auto: true, guard: true, fold: false, mode: 'separate', placement: 'anchor', strip: true, engine: 'nai', gpt: defaultGpt(), comfy: defaultComfy(),
+  return {enabled: false, auto: true, guard: true, skipPaidConfirm: false, fold: false, mode: 'separate', placement: 'anchor', strip: true, engine: 'nai', gpt: defaultGpt(), comfy: defaultComfy(),
     connections: {nai: normalizeImageConnections('nai'), gpt: normalizeImageConnections('gpt')},
     queue: {gap: 3, retries: 4, cloud: {enabled: false, kind: 'room', url: '', room: ''}}, relay: {url: '', assumeOpus: false}, vibe: defaultVibe(), params: defaultDrawParams(),
     chunks: [], chunkGroups: [], selectionDraw: true, stream: false, autoDownload: false, locks: [], grid: normalizeGrid(), positionGrid: normalizePositionGrid(), maskLook: normalizeMaskLook(), styles: [structuredClone(DEFAULT_STYLE)], styleGroups: [], activeStyle: 'default', presets: [structuredClone(DEFAULT_PRESET)], activePreset: 'default'};
@@ -429,6 +429,7 @@ export function normalizeDraw(value) {
   d.auto = d.auto !== false;
   d.selectionDraw = d.selectionDraw !== false;
   d.guard = d.guard !== false;
+  d.skipPaidConfirm = !!d.skipPaidConfirm;
   d.fold = !!d.fold;
   d.strip = d.strip !== false;
   d.mode = d.mode === 'inline' ? 'inline' : 'separate';
